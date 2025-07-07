@@ -1,32 +1,31 @@
 // lib/pdf-utils.ts
 
-// Only import PDF.js in the browser to prevent SSR issues
+import { supabase } from "@/lib/supabase";
+import Tesseract from "tesseract.js";
+
 let pdfjsLib: typeof import("pdfjs-dist") | null = null;
 
 if (typeof window !== "undefined") {
-  // Dynamically import pdfjsLib to ensure it's only loaded on the client
   import("pdfjs-dist").then((lib) => {
     pdfjsLib = lib;
-    if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-      pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
-    }
+    // Force workerSrc regardless of version availability
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   });
 }
 
 /**
- * Extract text content from a PDF file using PDF.js
+ * Extract text content from a PDF file using PDF.js, with fallback to OCR if needed.
  */
 export async function extractTextFromPDF(file: File): Promise<string> {
   if (typeof window === "undefined") {
     throw new Error("PDF extraction is only supported in the browser.");
   }
 
-  // Dynamically import if not loaded
   if (!pdfjsLib) {
     pdfjsLib = await import("pdfjs-dist");
-    if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-      pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
-    }
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   }
 
   try {
@@ -39,11 +38,6 @@ export async function extractTextFromPDF(file: File): Promise<string> {
       const page = await pdf.getPage(i);
       const textContent = await page.getTextContent();
 
-      if (!textContent || !textContent.items || textContent.items.length === 0) {
-        console.warn(`No text content found on page ${i}`);
-        continue;
-      }
-
       const pageText = textContent.items
         .filter((item: any) => item.str && typeof item.str === "string")
         .map((item: any) => item.str)
@@ -52,19 +46,43 @@ export async function extractTextFromPDF(file: File): Promise<string> {
       fullText += pageText + "\n";
     }
 
-    if (!fullText.trim()) {
-      throw new Error(
-        "No text content could be extracted from the PDF. The document may be scanned or contain only images."
-      );
-    }
+    if (!fullText.trim()) throw new Error("no_text");
 
     return fullText.trim();
   } catch (error: any) {
-    console.error("Error extracting text from PDF:", error);
-    if (error.message?.includes("worker")) {
-      throw new Error("PDF processing failed. Please try again or use a different PDF.");
+    console.warn("PDF.js failed or no text found, trying OCR fallback...", error);
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+      let ocrText = "";
+
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const viewport = page.getViewport({ scale: 2 });
+
+        const canvas = document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+
+        await page.render({ canvasContext: context!, viewport }).promise;
+
+        const dataUrl = canvas.toDataURL("image/png");
+
+        const { data } = await Tesseract.recognize(dataUrl, "eng");
+        ocrText += data.text + "\n";
+      }
+
+      ocrText = ocrText.trim();
+
+      if (!ocrText) throw new Error("OCR failed");
+      return ocrText;
+    } catch (ocrError) {
+      console.error("OCR also failed:", ocrError);
+      throw new Error("This PDF contains only images or scanned pages. Text extraction failed.");
     }
-    throw new Error("Failed to extract text from PDF. The document may be scanned or contain only images.");
   }
 }
 
@@ -79,32 +97,27 @@ export function formatFileSize(bytes: number): string {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 }
 
-// Example upload function (place in your upload handler/component)
-import { supabase } from "@/lib/supabase";
-
+/**
+ * Upload a PDF to Supabase and extract its text (with OCR fallback).
+ */
 export async function uploadPDF(file: File, userId: string) {
-  // 1. Extract text
   const content = await extractTextFromPDF(file);
 
-  // 2. Upload file to Supabase Storage
   const { data: storageData, error: storageError } = await supabase.storage
-    .from("pdfs")
+    .from("documents")
     .upload(`${userId}/${file.name}`, file);
 
   if (storageError) throw storageError;
 
-  // 3. Insert metadata into documents table
-  const { data, error } = await supabase
-    .from("documents")
-    .insert([
-      {
-        user_id: userId,
-        name: file.name,
-        size: file.size,
-        content,
-        file_url: storageData.path,
-      },
-    ]);
+  const { data, error } = await supabase.from("documents").insert([
+    {
+      user_id: userId,
+      name: file.name,
+      size: file.size,
+      content,
+      file_url: storageData.path,
+    },
+  ]);
 
   if (error) throw error;
 
